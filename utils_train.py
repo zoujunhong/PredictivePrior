@@ -352,10 +352,9 @@ def get_params_groups(model, spetial_list={}, lr=0.001, wd=.01):
     return to_return
 
 
-def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epochs=0, start_warmup_value=0):
+def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_iters=0, start_warmup_value=0):
     warmup_schedule = np.array([])
-    warmup_iters = warmup_epochs * niter_per_ep
-    if warmup_epochs > 0:
+    if warmup_iters > 0:
         warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
 
     iters = np.arange(epochs * niter_per_ep - warmup_iters)
@@ -365,10 +364,9 @@ def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epoch
     assert len(schedule) == epochs * niter_per_ep
     return schedule
 
-def exp_scheduler(base_value, decay_rate, decay_steps, epochs, niter_per_ep, warmup_epochs=0, start_warmup_value=0):
+def exp_scheduler(base_value, decay_rate, decay_steps, epochs, niter_per_ep, warmup_iters=0, start_warmup_value=0):
     warmup_schedule = np.array([])
-    warmup_iters = int(warmup_epochs * niter_per_ep)
-    if warmup_epochs > 0:
+    if warmup_iters > 0:
         warmup_schedule = np.linspace(start_warmup_value, base_value * (decay_rate**(warmup_iters / decay_steps)), warmup_iters)
 
     iters = np.arange(epochs * niter_per_ep - warmup_iters)

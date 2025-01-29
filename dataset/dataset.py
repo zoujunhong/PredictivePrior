@@ -13,15 +13,12 @@ from torchvision import transforms as pth_transforms
 class MOVi(torch.utils.data.Dataset):
 
     def __init__(self,
-                 data_root='/root/onethingai-tmp/data/movi_c',
+                 data_root='/path/to/movi_c',
                  split='train',
                  resolution=224):
         self.img_root = osp.join(data_root,split,'video')
         self.img_infos = sorted(os.listdir(self.img_root))
         self.resolution = resolution
-        # self.transform = pth_transforms.Compose([
-        #     pth_transforms.ToTensor(),
-        #     pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))])
         
         self.transform = pth_transforms.Compose([
             pth_transforms.ToTensor(),
@@ -44,17 +41,13 @@ class MOVi(torch.utils.data.Dataset):
 class MOVi_test(torch.utils.data.Dataset):
 
     def __init__(self,
-                 data_root='/root/onethingai-tmp/data/movi_c',
+                 data_root='/path/to/movi_c',
                  split='train',
                  resolution=224):
         self.img_root = osp.join(data_root,split,'video')
         self.ann_root = osp.join(data_root,split,'seg')
         self.img_infos = sorted(os.listdir(self.img_root))
 
-        # self.transform = pth_transforms.Compose([
-        #     pth_transforms.ToTensor(),
-        #     pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        # ])
         self.transform = pth_transforms.Compose([
             pth_transforms.ToTensor(),
             pth_transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),

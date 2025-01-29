@@ -3,6 +3,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mambapy.mamba import Mamba, MambaConfig
+
 
 def linear(in_features, out_features, bias=True, weight_init='xavier', gain=1.):
     
@@ -112,6 +114,21 @@ def load_and_freeze(model: nn.Module, dict_name):
 def stop_grad(model: nn.Module):
     for name, param in model.named_parameters():
         param.requires_grad = False
+
+class RMSNorm2D(nn.Module):
+    """Basic block for ResNet."""
+    def __init__(self,
+                 dim,
+                 affine=True):
+        super(RMSNorm2D, self).__init__()
+        self.norm = nn.RMSNorm(dim, elementwise_affine=affine)
+
+    def forward(self, x: torch.Tensor): # x shape [b,c,h,w]
+        b,c,h,w = x.shape
+        x = x.flatten(2,3).permute(0,2,1).contiguous()
+        x = self.norm(x)
+        x = x.permute(0,2,1).reshape(b,c,h,w).contiguous()
+        return x
         
 class LayerNorm2D(nn.Module):
     """Basic block for ResNet."""
@@ -264,6 +281,12 @@ def HardSoftmax(x, dim=-1):
     y_hard = torch.zeros_like(x).scatter_(dim, index, 1.)
     return (y_hard - y_soft).detach() + y_soft
 
+def HardMax(x: torch.Tensor, dim=-1):
+    y_soft = x
+    index = y_soft.argmax(dim, keepdim=True)
+    y_hard = torch.zeros_like(x).scatter_(dim, index, 1.)
+    return (y_hard - y_soft).detach() + y_soft
+
 ############################################# Transformer #############################################
 # -----------------------------------------------------------------------------------------------------
 
@@ -316,8 +339,8 @@ class MultiheadAttention(torch.nn.Module):
         self.num_heads = num_heads
         self.size_head = int(output_cap_dim / num_heads)
 
-        self.norm_input = nn.LayerNorm(input_cap_dim)
-        self.norm = nn.LayerNorm(output_cap_dim) 
+        self.norm_input = nn.LayerNorm(input_cap_dim, eps=1e-4)
+        self.norm = nn.LayerNorm(output_cap_dim, eps=1e-4) 
         self.dropout = DropPath(attention_dropout)
 
         self.proj = nn.Linear(output_cap_dim, output_cap_dim)
@@ -342,7 +365,11 @@ class MultiheadAttention(torch.nn.Module):
         if mask is not None:
             att_scores = torch.masked_fill(att_scores, mask, float('-inf'))
         
-        att_probs = F.softmax(att_scores, dim=-1)
+        if self.norm_direction == 0:
+            att_probs = F.softmax(att_scores, dim=-1, dtype=att_scores.dtype)
+        else:
+            att_probs = F.softmax(att_scores, dim=-2, dtype=att_scores.dtype)
+            att_probs = att_probs / (torch.sum(att_probs, dim=-1, keepdim=True) + 1e-4)
 
         # Compute weighted-sum of the values using the attention distribution
         control = att_probs.matmul(values)      # [B, N, F, H]
@@ -351,7 +378,7 @@ class MultiheadAttention(torch.nn.Module):
         control = control.reshape(b, n, self.dim) # [B*F, N*H]
         # This newly computed information will control the bias/gain of the new from_tensor
         output = output + self.dropout(self.proj(control))
-        return queries, output
+        return att_probs, output
 
 
 class SimplexAttention(torch.nn.Module):
@@ -376,7 +403,7 @@ class SimplexAttention(torch.nn.Module):
         self.num_heads = num_heads
         self.size_head = int(output_dim / num_heads)
 
-        self.norm = nn.LayerNorm(output_dim, elementwise_affine=False)
+        self.norm = nn.LayerNorm(output_dim, elementwise_affine=False, eps=1e-4)
         # self.dropout = DropPath(attention_dropout)
 
         self.modulation = nn.Sequential(
@@ -454,7 +481,7 @@ class TransformerDecoderLayer(torch.nn.Module):
             nn.GELU(),
             nn.Linear(4*output_cap_dim,output_cap_dim))
 
-    def forward(self, input_cap, output_cap, mask_input=None, mask_output=None):
+    def forward(self, input_cap, output_cap, mask_output=None):
         if self.self_attn:
             _, output_cap = self.self_attn(output_cap, output_cap, mask=mask_output)
             
@@ -476,16 +503,16 @@ class TransformerEncoderLayer(torch.nn.Module):
         self.droppath = DropPath(attention_dropout)
         self.FFN = nn.Sequential(
             nn.Linear(output_cap_dim,4*output_cap_dim),
-            nn.LayerNorm(4*output_cap_dim),
+            nn.LayerNorm(4*output_cap_dim, eps=1e-4),
             nn.GELU(),
             nn.Linear(4*output_cap_dim,output_cap_dim),
-            nn.LayerNorm(output_cap_dim))
+            nn.LayerNorm(output_cap_dim, eps=1e-4))
 
 
     def forward(self, x, mask=None):
         x, attn = self.attn(x, mask=mask)
         x = self.ffn(x)
-        return x, attn
+        return x
     
     def attn(self, x, mask=None):
         attn, x = self.self_attn(x, x, mask=mask)
@@ -494,3 +521,68 @@ class TransformerEncoderLayer(torch.nn.Module):
     def ffn(self, x):
         x = x + self.droppath(self.FFN(x))
         return x
+
+class SlotSSMLayer(torch.nn.Module):
+    def __init__(self,
+            num_slots = 11,
+            input_dim = 384,
+            slot_dim = 256,
+            num_heads = 4
+        ):                             # Ignore unrecognized keyword args
+
+        super().__init__()
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.input_dim = input_dim
+        
+        self.slot_mixer = TransformerEncoderLayer(slot_dim, num_heads)
+        self.slot_transformer = TransformerDecoderLayer(slot_dim, input_dim, num_heads, self_attn=False, direction=1)
+        
+        config = MambaConfig(d_model=slot_dim, n_layers=1)
+        self.slot_ssm = nn.ModuleList()
+        for i in range(num_slots):
+            self.slot_ssm.append(Mamba(config))
+
+    def forward(self, slots, x): # slots shape [B, T, K, D1], x shape [B, T, N, D2]
+        B, T, K, D = slots.shape
+        slots = slots.flatten(0,1)
+        x = x.flatten(0,1)
+        _, slots = self.slot_transformer(x, slots)
+        
+        slots = slots.reshape(B, T, K, D)
+        y = torch.zeros_like(slots, device=slots.device)
+        for i in range(K):
+            y[:,:,i,:] = self.slot_ssm[i](slots[:,:,i,:])
+        
+        y = y.flatten(0,1)
+        z = self.slot_mixer(y)
+        
+        return z.reshape(B, T, K, D)
+
+
+class SlotSSMLayer_wo_ca(torch.nn.Module):
+    def __init__(self,
+            num_slots = 11,
+            input_dim = 384,
+            slot_dim = 256,
+            num_heads = 4
+        ):                             # Ignore unrecognized keyword args
+
+        super().__init__()
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.input_dim = input_dim
+        
+        self.slot_mixer = TransformerEncoderLayer(slot_dim, num_heads)
+        
+        config = MambaConfig(d_model=slot_dim, n_layers=1)
+        self.slot_ssm = Mamba(config)
+
+    def forward(self, slots): # slots shape [B, T, K, D1]
+        B, T, K, D = slots.shape
+        slots = self.slot_mixer(slots.flatten(0,1)).reshape(B, T, K, D)
+        slots = slots.permute(0,2,1,3).flatten(0,1)
+        y = self.slot_ssm(slots)
+        y = y.reshape(B, K, T, D).permute(0,2,1,3)
+        return y
+

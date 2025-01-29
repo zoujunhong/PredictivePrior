@@ -3,20 +3,18 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # os.environ["TORCHDYNAMO_VERBOSE"] = "1"
 # os.environ["TORCH_LOGS"] = "+dynamo"
-
+import copy
 import time
 import json
 # import math
 import random
 import argparse
-
-from distutils.version import LooseVersion
 # Numerical libs
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 # Our libs
-from dataset.dataset import MOVi_dino as Dataset
+from dataset.dataset import MOVi as Dataset
 from model.PredSeg_tf import SlotAttentionAutoEncoder as Model
 from utils_train import AverageMeter, get_params_groups, cosine_scheduler, MultiEpochsDataLoader
 import numpy as np
@@ -37,15 +35,14 @@ torch.cuda.manual_seed_all(seed_value)   # 为所有GPU设置随机种子（多�
 from loss.loss import RecLPIPSLoss
 # train one epoch
 # @torch.compile
-def train(segmentation_module, data_loader, optimizers, epoch, gpu, lr_schedule, lambda_schedule, sigma_schedule, rec_loss: RecLPIPSLoss):
+def train(model, data_loader, optimizers, epoch, gpu, lr_schedule, sigma_schedule, rec_loss: RecLPIPSLoss):
     batch_time = AverageMeter()
     ave_loss_1 = AverageMeter()
     ave_loss_2 = AverageMeter()
     ave_loss_3 = AverageMeter()
     ave_loss_4 = AverageMeter()
-    ave_loss_5 = AverageMeter()
     
-    segmentation_module.train()
+    model.train()
     epoch_iters = len(data_loader)
     data_loader.sampler.set_epoch(epoch)
 
@@ -58,26 +55,20 @@ def train(segmentation_module, data_loader, optimizers, epoch, gpu, lr_schedule,
             param_group["lr"] = lr_schedule[it] * param_group["base_lr"]
 
         _sigma = sigma_schedule[it] if it < len(sigma_schedule) else sigma_schedule[-1]
-        # _lambda = lambda_schedule[0] if it < 0.25 * len(lambda_schedule) else (lambda_schedule[it * 2 - len(lambda_schedule)//2] if it < 0.75 * len(lambda_schedule) else lambda_schedule[-1])
-        # _lambda = lambda_schedule[it]
-        dino_feat, imgs, masks= data
+        imgs = data
         
-        b, h, w = masks.shape
-        masks = torch.zeros([b,11,h,w]).scatter_(1, masks[:,None,:,:].long(), 1.)
-        masks = masks.cuda(gpu)
-        
-        imgs = imgs.cuda(gpu)
-        dino_feat = dino_feat.cuda(gpu)
-        optimizers.zero_grad()
         # forward pass
-        rec, loss_seg = segmentation_module(imgs, dino_feat, _sigma)
+        imgs = imgs.cuda(gpu)
+        rec, loss_smooth, loss_consistent = model(imgs, _sigma)
+            
         loss_rec = rec_loss(rec, imgs)
-        loss_total = loss_rec['total_loss'] + loss_seg
+        loss_total = loss_rec['total_loss'] + loss_smooth + loss_consistent
         
         # # Backward
         loss_total.backward()
         optimizers.step()
 
+        optimizers.zero_grad()
         # # measure elapsed time
         batch_time.update(time.time() - tic)
         tic = time.time()
@@ -85,16 +76,17 @@ def train(segmentation_module, data_loader, optimizers, epoch, gpu, lr_schedule,
         # # update average loss and acc
         ave_loss_1.update(loss_rec['recon_loss'].item())
         ave_loss_2.update(loss_rec['percept_loss'].item())
-        ave_loss_3.update(loss_seg.item())
+        ave_loss_3.update(loss_smooth.item())
+        ave_loss_4.update(loss_consistent.item())
 
         if dist.get_rank()==0:
             print('[{}][{}/{}], lr: {:.3f}, '
                   'time: {:.2f}, '
-                  'Loss: {:.3f}, {:.3f}, {:.3f}'
+                  'Loss: {:.3f}, {:.3f}, {:.3f}, {:.3f}'
                   .format(epoch, idx, epoch_iters, lr_schedule[it], batch_time.average(),  
-                  ave_loss_1.average(), ave_loss_2.average(), ave_loss_3.average()))
+                  ave_loss_1.average(), ave_loss_2.average(), ave_loss_3.average(), ave_loss_4.average()))
 
-def checkpoint(nets, optimizer, args, epoch):
+def checkpoint(nets, args, epoch):
     print('Saving checkpoints...')
     net_encoder = nets.module
     
@@ -103,10 +95,7 @@ def checkpoint(nets, optimizer, args, epoch):
         
     torch.save(
         net_encoder.state_dict(),
-        '{}/model_epoch_{}.pth'.format(args.saveroot, epoch))
-    # torch.save(
-    #     optimizer.state_dict(),
-    #     '{}/opt_epoch_{}.pth'.format(args.saveroot, epoch))
+        '{}/model.pth'.format(args.saveroot, epoch))
 
 
 def main(gpu,args):
@@ -127,19 +116,9 @@ def main(gpu,args):
     sampler_train =torch.utils.data.distributed.DistributedSampler(dataset_train)
     loader_train = MultiEpochsDataLoader(dataset_train, batch_size=args.batchsize, shuffle=False, sampler=sampler_train, 
                                     pin_memory=True, num_workers=args.workers, drop_last=True)
-    
-    # load nets into gpu
-    to_load = torch.load(os.path.join('/root/onethingai-tmp/savemodel/PredSeg_0806','model_epoch_30.pth'),map_location=torch.device("cpu"),weights_only=True)
-    keys_list = list(to_load.keys())
-    for key in keys_list:
-        if 'orig_mod.' in key:
-            deal_key = key.replace('_orig_mod.', '')
-            to_load[deal_key] = to_load[key]
-            del to_load[key]
-    model.load_state_dict(to_load,strict=False)
 
     if args.resume_epoch!=0:
-        to_load = torch.load(os.path.join(args.saveroot,'model_epoch_{}.pth'.format(args.resume_epoch)),map_location=torch.device("cpu"))
+        to_load = torch.load(os.path.join(args.saveroot,'model_epoch_{}.pth'.format(args.resume_epoch)),map_location=torch.device("cpu"),weights_only=True)
         model.load_state_dict(to_load,strict=False)
 
     
@@ -150,46 +129,33 @@ def main(gpu,args):
                 find_unused_parameters=False)
 
     # Set up optimizers
-    param_groups = get_params_groups(model, lr = args.lr) #, spetial_list=
-                                    #  {'encoder':{'params': [], 'base_lr': args.lr, 'weight_decay': 0.01},
-                                    #   'encoder_bias':{'params': [], 'base_lr': args.lr, 'weight_decay': 0.0}})
+    param_groups = get_params_groups(model, lr = args.lr)
     optimizer = torch.optim.AdamW(param_groups)
-
+    # optimizer = Opt(param_groups)     
     
     lr_schedule = cosine_scheduler(
         1.00,  # linear scaling rule
         0.01,
         args.total_epoch, 
         len(loader_train),
-        warmup_epochs=0)
+        warmup_iters=0)
     
     sigma_schedule = cosine_scheduler(
-        0.5,  # linear scaling rule
+        1.0,  # linear scaling rule
         0.,
-        5, 
-        len(loader_train),
-        warmup_epochs=0)
-    
-    lambda_schedule = cosine_scheduler(
-        0.,  # linear scaling rule
-        1.,
-        args.total_epoch, 
-        len(loader_train),
-        warmup_epochs=0)
+        10, 
+        len(loader_train))
     
     # Main loop
     lpips_loss = RecLPIPSLoss().cuda(load_gpu)
     lpips_loss.eval()
-    lpips_loss = torch.compile(lpips_loss)
-    model = torch.compile(model)
-    checkpoint(model, optimizer, args, 0)
     for epoch in range(args.resume_epoch, args.total_epoch):
         print('Epoch {}'.format(epoch))
-        train(model, loader_train, optimizer, epoch, load_gpu, lr_schedule, lambda_schedule, sigma_schedule, lpips_loss)
+        train(model, loader_train, optimizer, epoch, load_gpu, lr_schedule, sigma_schedule, lpips_loss)
 
         # checkpointing
         if dist.get_rank() == 0 and (epoch+1)%args.save_step==0:
-            checkpoint(model, optimizer, args, epoch+1)
+            checkpoint(model, args, epoch+1)
 
     print('Training Done!')
 
@@ -198,15 +164,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description="PyTorch Semantic Segmentation Training"
     )
-    parser.add_argument("--batchsize",type=int,default=16)
+    parser.add_argument("--batchsize",type=int,default=32)
     parser.add_argument("--workers",type=int,default=4)
     parser.add_argument("--start_gpu",type=int,default=0)
-    parser.add_argument("--gpu_num",type=int,default=3)
+    parser.add_argument("--gpu_num",type=int,default=2)
     parser.add_argument("--lr",type=float,default=1e-4)
-    parser.add_argument("--saveroot",type=str,default='/root/onethingai-tmp/savemodel/MOVi_PredSeg_th01')
-    parser.add_argument("--total_epoch",type=int,default=20)
+    parser.add_argument("--saveroot",type=str,default='/path/to/save/checkpoint')
+    parser.add_argument("--total_epoch",type=int,default=120)
     parser.add_argument("--resume_epoch",type=int,default=0)
-    parser.add_argument("--save_step",type=int,default=5)
+    parser.add_argument("--save_step",type=int,default=15)
     parser.add_argument("--port",type=int,default=45321)
     args = parser.parse_args()
 

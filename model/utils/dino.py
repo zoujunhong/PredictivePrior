@@ -81,7 +81,7 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+        attn = attn.softmax(dim=-1, dtype=attn.dtype)
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
@@ -100,11 +100,11 @@ class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
-        self.norm1 = norm_layer(dim)
+        self.norm1 = norm_layer(dim, eps=1e-4)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
+        self.norm2 = norm_layer(dim, eps=1e-4)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
@@ -239,21 +239,21 @@ class VisionTransformer(nn.Module):
 def vit_tiny(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-4), **kwargs)
     return model
 
 
 def vit_small(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-4), **kwargs)
     return model
 
 
 def vit_base(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-4), **kwargs)
     return model
 
 

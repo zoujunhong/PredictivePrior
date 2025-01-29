@@ -104,7 +104,7 @@ class ResNet(nn.Module):
 
         self.multi_scale_aggregation = multi_scale_aggregation
         if multi_scale_aggregation:
-            self.head_layer = IterativeHead(in_channels=[base_channels//8,base_channels//4,base_channels//2])
+            self.head_layer = IterativeHead(in_channels=[base_channels//16,base_channels//8,base_channels//4,base_channels//2])
 
     def forward(self, x):
         """Forward function."""

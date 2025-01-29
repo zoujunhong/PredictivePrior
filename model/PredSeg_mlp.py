@@ -1,11 +1,11 @@
-from .utils.networks import SlotAttention
+from .utils.networks import SlotAttention, ConvNorm, LinearNorm, load_and_freeze
 import numpy as np
 from torch import nn
 import torch
 import torch.nn.functional as F
 from .utils.resnet import ResNet
+from .utils.PredictivePrior import DINOPredictor
 from .utils.StyleGANGenerator import Decoder
-
 
 def build_grid(resolution):
     ranges = [np.linspace(0., 1., num=res) for res in resolution]
@@ -57,22 +57,55 @@ class SlotAttentionAutoEncoder(nn.Module):
             nn.Linear(4 * hid_dim, hid_dim),
             nn.LayerNorm(hid_dim))
         
+        self.pixel_decoder = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bicubic', align_corners=False),
+            ConvNorm(self.hid_dim, self.hid_dim//2, 3, 1, 1),
+            nn.Upsample(scale_factor=2, mode='bicubic', align_corners=False),
+            ConvNorm(self.hid_dim//2, self.hid_dim//4, 3, 1, 1),
+            nn.Conv2d(self.hid_dim//4, self.hid_dim//4, 1, 1, 0))
+        
+        self.slot_mapping = nn.Sequential(
+            LinearNorm(self.slot_dim, self.slot_dim),
+            nn.Linear(self.slot_dim, self.hid_dim//4))
+        
         self.slot_attn = SlotAttention(self.slot_dim, self.slot_dim*4, feat_size=self.hid_dim, num_slots=self.num_slots)
         self.generator = Decoder(slot_dim=self.slot_dim, hid_dim=256, resolution=self.resolution//16, block_num=4)
 
-    def forward(self, image, sigma=0):
+        self.predictor = DINOPredictor()
+        load_and_freeze(self.predictor, '/root/to/predictor')
+
+
+    def forward(self, image, dino_feat=torch.randn((1, 256, 384)), sigma=0):
         feat = self.encoder(image)
         b, c, h, w = feat.shape
         feat = feat.permute(0,2,3,1).contiguous()
+        print(feat.shape)
         feat = self.encoder_pos(feat)
         feat = torch.flatten(feat, 1, 2)
         feat = feat + self.mlp(feat)  # CNN Backbone.
         
         slots, _ = self.slot_attn(feat, sigma=sigma)
-
+        
+        feats_lowrank = self.pixel_decoder(feat.permute(0,2,1).reshape(b, self.hid_dim, self.resolution//4, self.resolution//4))[:,None]
+        slots_map = self.slot_mapping(slots)[:,:,:,None,None]
+        masks = torch.softmax(torch.sum(feats_lowrank * slots_map, dim=2)/(self.hid_dim/4)**0.5, dim=1)
+        
         rec_rgb, recons, alpha_masks = self.generator(slots)
 
-        return rec_rgb
+        with torch.no_grad():
+            pred_sim, source_grid, target_grid = self.predictor.forward_whole(dino_feat)
+            W = ((pred_sim-0.9) * 10).clamp(-1, 1)
+            
+        source_mask = F.grid_sample(masks, source_grid, mode='bilinear', align_corners=True).flatten(2,3).permute(0,2,1)
+        source_mask = F.normalize(source_mask, dim=-1) # [b, 256, k]
+        
+        target_mask = F.grid_sample(masks, target_grid, mode='bilinear', align_corners=True).flatten(2,3).permute(0,2,1)
+        target_mask = F.normalize(target_mask, dim=-1)
+        
+        delta = 1 - torch.cosine_similarity(source_mask, target_mask, dim=-1)
+        
+        loss_smooth = torch.mean(W * delta) + F.l1_loss(alpha_masks, masks.detach())
+        return rec_rgb, loss_smooth
     
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 import numpy as np
 from torch import nn
 import torch
+import torch.nn.functional as F
 from .networks import SimplexAttention
 
 class ResLayer(nn.Module):
@@ -10,8 +11,8 @@ class ResLayer(nn.Module):
                  upsample=False):
         super(ResLayer, self).__init__()
         self.planes = planes
-        self.norm1 = nn.GroupNorm(1, planes)
-        self.norm2 = nn.GroupNorm(1, planes)
+        self.norm1 = nn.GroupNorm(1, planes, eps=1e-4)
+        self.norm2 = nn.GroupNorm(1, planes, eps=1e-4)
 
         self.conv1 = nn.Conv2d(planes, planes, 3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(planes, planes, 3, padding=1)
@@ -74,12 +75,12 @@ class SoftPositionEmbed(nn.Module):
         grid = self.embedding(self.grid)
         return inputs + grid
 
-
 class Generator(nn.Module):
     def __init__(self, slot_dim=512, base_dim=512, out_dim=3, base_resolution=7, target_resolution=224, block_num=4):
         super().__init__()
         self.grid = nn.Parameter(torch.randn([1,base_dim, base_resolution,base_resolution]), requires_grad=True) # [1,4,h,w]
         self.generator_blocks = nn.ModuleList()
+        self.block_num = block_num
         for i in range(block_num):
             upsample = base_resolution < target_resolution
             self.generator_blocks.append(SynthesisBlock(slot_dim, base_dim, 2, upsample=upsample))
@@ -92,37 +93,8 @@ class Generator(nn.Module):
             ResLayer(base_dim//2, False),
             nn.Conv2d(base_dim//2, out_dim, 1, 1, 0))
         
-        # self.end_cnn = nn.Sequential(
-        #     ResLayer(base_dim, False),
-        #     nn.Conv2d(base_dim, out_dim, 1, 1, 0))
-        
 
     def forward(self, slots):
-        b = slots.shape[0]
-        init_grid = torch.repeat_interleave(self.grid,b,0)
-        for i in range(len(self.generator_blocks)):
-            init_grid, attn = self.generator_blocks[i](init_grid, slots)
-
-        return self.end_cnn(init_grid), attn
-
-class Generator_isa(nn.Module):
-    def __init__(self, slot_dim=512, base_dim=512, out_dim=3, base_resolution=7, target_resolution=224, block_num=4):
-        super().__init__()
-        self.grid = nn.Parameter(torch.randn([1,base_dim, base_resolution,base_resolution]), requires_grad=True) # [1,4,h,w]
-        self.generator_blocks = nn.ModuleList()
-        for i in range(block_num):
-            upsample = base_resolution < target_resolution
-            self.generator_blocks.append(SynthesisBlock(slot_dim, base_dim, 2, upsample=upsample))
-            base_dim = base_dim//2 if upsample else base_dim
-            base_resolution = base_resolution * 2 if upsample else base_resolution
-
-        
-        self.end_cnn = nn.Sequential(
-            ResLayer(base_dim, False),
-            nn.Conv2d(base_dim, out_dim, 1, 1, 0))
-        
-
-    def forward(self, slots, rel_grid):
         b = slots.shape[0]
         init_grid = torch.repeat_interleave(self.grid,b,0)
         for i in range(len(self.generator_blocks)):
