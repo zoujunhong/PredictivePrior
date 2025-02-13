@@ -21,7 +21,7 @@ import numpy as np
 import torch.multiprocessing as mp
 import torch.distributed as dist
 import datetime as datetime
-torch.set_float32_matmul_precision('medium')
+torch.set_float32_matmul_precision('high')
 seed_value = 42   # 设定随机数种子
 
 np.random.seed(seed_value)

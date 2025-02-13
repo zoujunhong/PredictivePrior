@@ -79,7 +79,6 @@ class SlotAttentionAutoEncoder(nn.Module):
         feat = self.encoder(image)
         b, c, h, w = feat.shape
         feat = feat.permute(0,2,3,1).contiguous()
-        print(feat.shape)
         feat = self.encoder_pos(feat)
         feat = torch.flatten(feat, 1, 2)
         feat = feat + self.mlp(feat)  # CNN Backbone.
